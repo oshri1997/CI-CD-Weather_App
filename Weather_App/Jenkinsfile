@@ -1,0 +1,191 @@
+pipeline {
+    agent {
+        docker {
+            alwaysPull true
+            image 'agent'
+            args '-v /var/run/docker.sock:/var/run/docker.sock -u 0:0 --privileged'
+        }
+    }
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '15'))
+    }
+    environment {
+        SONARQUBE_ENV = 'SonarQube'
+        SONAR_PROJECT_KEY = 'my-weather-app'
+    }
+    stages {
+        stage('Checkout') {
+            steps {
+                scmSkip(deleteBuild: true, skipPattern: '.*\\[ci skip\\].*')
+            }
+        }
+        stage('Static Code Analysis') {
+            steps {
+                script {
+                    withSonarQubeEnv(env.SONARQUBE_ENV) {
+                        sh "sonar-scanner -Dsonar.projectKey=${env.SONAR_PROJECT_KEY} -Dsonar.sources=."
+                    }
+                    timeout(time: 1, unit: 'MINUTES') {
+                        def qg = waitForQualityGate()
+                        if (qg.status != 'OK') {
+                            error "Pipeline aborted due to quality gate failure: ${qg.status}"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Dependencies Scanning') {
+            steps {
+                script {
+                    sh '''
+                    trivy fs --exit-code 1 --scanners vuln --severity CRITICAL .
+                    trivy config --exit-code 1 --severity CRITICAL Dockerfile.web
+                    '''
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    sh 'docker-compose -f docker-compose.yml up -d --build'
+                }
+            }
+        }
+
+        stage('Test') {
+            steps {
+                script {
+                    sh 'python3 -m unittest sele.py'
+                }
+            }
+        }
+
+        stage('Update Version in README') {
+            steps {
+                script {
+                    withCredentials([usernamePassword(credentialsId: 'GitLab_Admin', usernameVariable: 'GITLAB_USERNAME', passwordVariable: 'GITLAB_TOKEN')]) {
+                        def currentVersion = sh(script: "grep -oP 'version:\\K[0-9]+\\.[0-9]+\\.[0-9]+' README.md", returnStdout: true).trim()
+                        if (!currentVersion) {
+                            error "Version not found in README.md"
+                        }
+                        def (major, minor, patch) = currentVersion.tokenize('.').collect { it as int }
+                        patch += 1
+                        def newVersion = "${major}.${minor}.${patch}"
+
+                        env.IMAGE_TAG = newVersion
+                        echo "Updated version to ${env.IMAGE_TAG}"
+
+                        sh """
+                        git config --global --add safe.directory /home/ubuntu/workspace/weather-app-multibranch_develop
+                        git checkout ${env.BRANCH_NAME}
+                        git pull origin ${env.BRANCH_NAME}
+                        sed -i 's/version:${currentVersion}/version:${newVersion}/' README.md
+                        git config user.name "Jenkins"
+                        git config user.email "jenkins@example.com"
+                        git add README.md
+                        git commit -m "[ci skip] Update version to ${env.IMAGE_TAG}"
+                        git push http://${GITLAB_USERNAME}:${GITLAB_TOKEN}@10.0.132.125/oshri1997/weather_app.git ${env.BRANCH_NAME}
+                        git tag ${env.IMAGE_TAG}
+                        git push http://${GITLAB_USERNAME}:${GITLAB_TOKEN}@10.0.132.125/oshri1997/weather_app.git ${env.BRANCH_NAME} ${env.IMAGE_TAG}
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Publish') {
+            steps {
+                withCredentials([aws(credentialsId: 'ec2_agent', accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                    sh """
+                    docker tag my-weather-app 897729114707.dkr.ecr.eu-central-1.amazonaws.com/my-weather-app:${env.IMAGE_TAG}
+                    docker push 897729114707.dkr.ecr.eu-central-1.amazonaws.com/my-weather-app:${env.IMAGE_TAG}
+                    """
+                }
+            }
+        }
+
+        stage('Sign Docker Image') {
+            steps {
+                withCredentials([
+                    file(credentialsId: 'private_cosign', variable: 'COSIGN_KEY'),
+                    string(credentialsId: 'cosign_pass', variable: 'COSIGN_PASSWORD')
+                ]) {
+                    script {
+                        sh """
+                        export COSIGN_PASSWORD=${COSIGN_PASSWORD}
+                        cosign sign --yes --key "${COSIGN_KEY}" 897729114707.dkr.ecr.eu-central-1.amazonaws.com/my-weather-app:${env.IMAGE_TAG}
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Verify Container Image') {
+            steps {
+                withCredentials([file(credentialsId: 'public_cosign', variable: 'COSIGN_PUBLIC')]) {
+                    script {
+                        sh """
+                        cosign verify \
+                        --key ${COSIGN_PUBLIC} \
+                        --allow-insecure-registry \
+                        --insecure-ignore-tlog=true \
+                        897729114707.dkr.ecr.eu-central-1.amazonaws.com/my-weather-app:${env.IMAGE_TAG}
+                        """
+                    }
+                }
+            }
+        }
+
+stage('Deploy') {
+    steps {
+        withCredentials([usernamePassword(credentialsId: 'GitLab_Admin', usernameVariable: 'GITLAB_USERNAME', passwordVariable: 'GITLAB_TOKEN')]) {
+            script {
+                def deploymentRepo = "http://${GITLAB_USERNAME}:${GITLAB_TOKEN}@10.0.132.125/oshri1997/deployment-repo.git"
+                sh """
+                if [ -d "deployment_repo" ]; then
+                    rm -rf deployment_repo
+                fi
+                git clone http://${GITLAB_USERNAME}:${GITLAB_TOKEN}@10.0.132.125/oshri1997/deployment-repo.git deployment_repo
+                cd deployment_repo
+                sed -i 's|image: .*|image: 897729114707.dkr.ecr.eu-central-1.amazonaws.com/my-weather-app:${env.IMAGE_TAG}|' deployment.yaml
+                git config user.name "Jenkins"
+                git config user.email "jenkins@example.com"
+                git add deployment.yaml
+                git commit -m "Update image tag to ${env.IMAGE_TAG}"
+                git push origin main
+                """
+
+            }
+        }
+    }
+}
+
+    }
+
+    post {
+        always {
+            script {
+                sh 'docker-compose down || true'
+                sh 'docker system prune -a -f || true'
+                cleanWs()
+            }
+        }
+        success {
+            slackSend(
+                channel: '#succeeded-build',
+                color: 'good',
+                message: "Build from branch:${env.BRANCH_NAME} number: ${env.BUILD_NUMBER} succeeded!"
+            )
+        }
+        failure {
+            slackSend(
+                channel: '#devops-alerts',
+                color: 'danger',
+                message: "Build from branch:${env.BRANCH_NAME} number: ${env.BUILD_NUMBER} failed!"
+            )
+        }
+    }
+
+}

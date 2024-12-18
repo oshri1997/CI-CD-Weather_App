@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Weather Information</title>
+    <link rel="stylesheet" href="../static/style.css">
+</head>
+<body>
+    <h1>Weather Information</h1>
+
+    {% if error %}
+        <p class="error">{{ error }}</p>
+    {% else %}
+        <h2>Weather Information for {{ city_info.name }}, {{ city_info.country }}</h2>
+
+        <h2>7-day Weather Forecast:</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Date</th>
+                    <th>Day Temp (°C)</th>
+                    <th>Night Temp (°C)</th>
+                    <th>Humidity (%)</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for item in forecast %}
+                <tr>
+                    <td>{{ item.datetime }}</td>
+                    <td>{{ item.day_temp }}°C</td>
+                    <td>{{ item.night_temp }}°C</td>
+                    <td>{{ item.humidity }}%</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    {% endif %}
+
+    <a href="/">Search another location</a>
+</body>
+</html>
